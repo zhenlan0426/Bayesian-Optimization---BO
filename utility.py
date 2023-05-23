@@ -17,7 +17,7 @@ from botorch.optim import optimize_acqf
 from gpytorch.kernels import RBFKernel,MaternKernel,ScaleKernel
 from gpytorch.priors.torch_priors import GammaPrior
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = 'cpu'
 dtype = torch.double
 
 class Transform(object):
