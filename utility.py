@@ -153,7 +153,7 @@ def BO(fun,x,y,T,\
     x_best_mean = choose_best(model,bounds,x,y,T,"mean")
     y_best_mean =  fun(*T.backward(x_best_mean[0]))
     
-    if y_best_exist > y_best_mean:
-        return x_best_exist,y_best_exist,x,y,model
+    if (y_best_exist > y_best_mean) ^ T.IsMax:
+        return x_best_mean,y_best_mean,x,y,model
     else:
-        return x_best_mean,y_best_mean,x,y,model     
+        return x_best_exist,y_best_exist,x,y,model    
