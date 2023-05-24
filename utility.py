@@ -30,6 +30,7 @@ class Transform(object):
         self.bounds = bounds
         self.IsMax = IsMax
         self.cat_feat_inv = [{v: k for k,v in cat_feat[d].items()} for d in cat_feat]
+        self.cat_shape = [len(cat_feat[k]) for k in cat_feat]
         
     def forward(self,parameter,score):
         # parameter: DataFrame -> x,y in [0,1]^d,R
@@ -103,6 +104,7 @@ def choose_best(model,bounds,x,y,T,type_):
         x_best = x.iloc[y_best]
         return x_best, y.iloc[y_best][0]
     if type_ == "mean":
+        # TODO: fix for softmax
         mean_fun = lambda x:model(x).mean
         x_best = optimize_acqf(mean_fun,bounds,q=1,num_restarts=1,raw_samples=1)[0].detach()
         return x_best
@@ -117,21 +119,27 @@ def BO(fun,x,y,T,\
        Bo_iter,
        verbose):
     # x: DataFrame of inputs, y: DF of scores
-    # TODO: bound for softmax transformation and needs to be pre-acq
     x_name = list(x.columns)
     x_tor,y_tor = T.forward(x,y)
-    d = x_tor.shape[1]
-    bounds = torch.tensor([[0.0] * d, [1.0] * d], device=device, dtype=dtype)    
-    
+    b = 10 # bound for logit
+    d0 = len(T.bounds)
+    d1 = x_tor.shape[1] - d0
+    bounds = torch.tensor([[0.0] * d0 + [-b] * d1, [1.0] * d0 + [b] * d1], device=device, dtype=dtype)    
     model = initialize_model(x_tor,y_tor, BaseKernel)
     for j in range(1,1+Bo_iter):
         # set up acqucision fun
         if 'best_f' in inspect.signature(acq_fun).parameters:
             acq_kwargs['best_f'] = y.max().item()
         acq = acq_fun(model,**acq_kwargs)
-
+        def acq2(x):
+            out = [x[:,:d0],]
+            count0 = d0
+            for d_i in T.cat_shape:
+                out.append(torch.softmax(x[:,count0:count0+d_i],1))
+                count0 += d_i
+            return acq(torch.cat(out,1))
         # optimize over x_next
-        x_next = optimize_acqf(acq,bounds,q=q,num_restarts=num_restarts,raw_samples=raw_samples)[0].detach() # 1,d
+        x_next = optimize_acqf(acq2,bounds,q=q,num_restarts=num_restarts,raw_samples=raw_samples)[0].detach() # 1,d
         x_next = T.backward(x_next[0])
         
         # try x_next
@@ -156,4 +164,4 @@ def BO(fun,x,y,T,\
     if (y_best_exist > y_best_mean) ^ T.IsMax:
         return x_best_mean,y_best_mean,x,y,model
     else:
-        return x_best_exist,y_best_exist,x,y,model    
+        return x_best_exist,y_best_exist,x,y,model 
