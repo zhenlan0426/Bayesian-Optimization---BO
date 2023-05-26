@@ -104,15 +104,22 @@ def choose_best(model,bounds,x,y,T,type_):
         x_best = x.iloc[y_best]
         return x_best, y.iloc[y_best][0]
     if type_ == "mean":
-        # TODO: fix for softmax
-        mean_fun = lambda x:model(x).mean
+        d0 = len(T.bounds)
+        def mean_fun(x):
+            out = [x[:,:d0],]
+            count0 = d0
+            for d_i in T.cat_shape:
+                out.append(torch.softmax(x[:,count0:count0+d_i],1))
+                count0 += d_i
+            return model(torch.cat(out,1)).mean
         x_best = optimize_acqf(mean_fun,bounds,q=1,num_restarts=1,raw_samples=1)[0].detach()
-        return x_best
+        return T.backward(x_best[0])
 
 def BO(fun,x,y,T,\
        acq_fun,
        acq_kwargs,
        BaseKernel,
+       eps,# f_best + eps
        q,
        num_restarts,
        raw_samples,
@@ -124,22 +131,24 @@ def BO(fun,x,y,T,\
     b = 10 # bound for logit
     d0 = len(T.bounds)
     d1 = x_tor.shape[1] - d0
+    def pre_softmax(module, x):
+        x = x[0] # input is a tuple
+        out = [x[:,:d0],]
+        count0 = d0
+        for d_i in T.cat_shape:
+            out.append(torch.softmax(x[:,count0:count0+d_i],1))
+            count0 += d_i
+        return torch.cat(out,1)
     bounds = torch.tensor([[0.0] * d0 + [-b] * d1, [1.0] * d0 + [b] * d1], device=device, dtype=dtype)    
     model = initialize_model(x_tor,y_tor, BaseKernel)
     for j in range(1,1+Bo_iter):
         # set up acqucision fun
         if 'best_f' in inspect.signature(acq_fun).parameters:
-            acq_kwargs['best_f'] = y.max().item()
+            acq_kwargs['best_f'] = y.max().item() + eps
         acq = acq_fun(model,**acq_kwargs)
-        def acq2(x):
-            out = [x[:,:d0],]
-            count0 = d0
-            for d_i in T.cat_shape:
-                out.append(torch.softmax(x[:,count0:count0+d_i],1))
-                count0 += d_i
-            return acq(torch.cat(out,1))
+        acq.register_forward_pre_hook(pre_softmax)
         # optimize over x_next
-        x_next = optimize_acqf(acq2,bounds,q=q,num_restarts=num_restarts,raw_samples=raw_samples)[0].detach() # 1,d
+        x_next = optimize_acqf(acq,bounds,q=q,num_restarts=num_restarts,raw_samples=raw_samples)[0].detach() # 1,d
         x_next = T.backward(x_next[0])
         
         # try x_next
@@ -159,7 +168,7 @@ def BO(fun,x,y,T,\
     
     x_best_exist,y_best_exist = choose_best(model,bounds,x,y,T,"existing")
     x_best_mean = choose_best(model,bounds,x,y,T,"mean")
-    y_best_mean =  fun(*T.backward(x_best_mean[0]))
+    y_best_mean =  fun(*x_best_mean)
     
     if (y_best_exist > y_best_mean) ^ T.IsMax:
         return x_best_mean,y_best_mean,x,y,model
