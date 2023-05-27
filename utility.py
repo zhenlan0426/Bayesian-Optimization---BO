@@ -10,6 +10,7 @@ import pandas as pd
 import inspect
 import torch
 from botorch.models import SingleTaskGP
+from botorch.acquisition.analytic import AnalyticAcquisitionFunction
 #from botorch.acquisition.analytic import ExpectedImprovement,ProbabilityOfImprovement,UpperConfidenceBound
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from botorch.fit import fit_gpytorch_mll # TODO fit_fully_bayesian_model_nuts
@@ -21,14 +22,13 @@ device = 'cpu'
 dtype = torch.double
 
 class Transform(object):
-    def __init__(self,cat_feat,integer,bounds,IsMax):
+    def __init__(self,cat_feat,integer,bounds):
         # cat_feat {feature name : {feature val: int val},...}
         # bounds  [[low_0,high_0],[]...], Assume cont_feat are before cat_feat in parameter
-        # IsMax is True, we aim to max the fun
+
         self.cat_feat = cat_feat
         self.integer = integer
         self.bounds = bounds
-        self.IsMax = IsMax
         self.cat_feat_inv = [{v: k for k,v in cat_feat[d].items()} for d in cat_feat]
         self.cat_shape = [len(cat_feat[k]) for k in cat_feat]
         
@@ -56,7 +56,6 @@ class Transform(object):
         cont_out = np.stack(cont_out,1)
         x = np.concatenate((cont_out,cat_out),1)
         y = (score.values - score.values.mean())/score.values.std()
-        y = y if self.IsMax else -y
         return torch.Tensor(x,device=device).to(dtype),torch.Tensor(y,device=device).to(dtype)
     
     def backward(self,x):
@@ -98,23 +97,37 @@ def initialize_model(x, y, BaseKernel, state_dict=None):
     fit_gpytorch_mll(mll);
     return model
 
-def choose_best(model,bounds,x,y,T,type_):
+def choose_best(model,bounds,x,y,T,type_,beta=0.5):
     if type_ == "existing":
-        y_best = np.argmax(y) if T.IsMax else np.argmin(y)
+        y_best = np.argmax(y)
         x_best = x.iloc[y_best]
         return x_best, y.iloc[y_best][0]
     if type_ == "mean":
-        d0 = len(T.bounds)
-        def mean_fun(x):
-            out = [x[:,:d0],]
-            count0 = d0
-            for d_i in T.cat_shape:
-                out.append(torch.softmax(x[:,count0:count0+d_i],1))
-                count0 += d_i
-            return model(torch.cat(out,1)).mean
+        mean_fun = Mean_std(model,beta)
         x_best = optimize_acqf(mean_fun,bounds,q=1,num_restarts=1,raw_samples=1)[0].detach()
         return T.backward(x_best[0])
 
+def hook_factory(T):
+    d0 = len(T.bounds)
+    def pre_softmax(module, x):
+        x = x[0] # input is a tuple
+        out = [x[:,:d0],]
+        count0 = d0
+        for d_i in T.cat_shape:
+            out.append(torch.softmax(x[:,count0:count0+d_i],1))
+            count0 += d_i
+        return torch.cat(out,1)
+    return pre_softmax
+
+class Mean_std(AnalyticAcquisitionFunction):
+    def __init__(self,model,beta) -> None:
+        super().__init__(model=model)
+        self.beta = beta
+
+    def forward(self, X):
+        mean, std = self._mean_and_sigma(X, compute_sigma=True)
+        return mean - self.beta * std
+    
 def BO(fun,x,y,T,\
        acq_fun,
        acq_kwargs,
@@ -128,28 +141,23 @@ def BO(fun,x,y,T,\
     # x: DataFrame of inputs, y: DF of scores
     x_name = list(x.columns)
     x_tor,y_tor = T.forward(x,y)
-    b = 10 # bound for logit
+    #b = 10 # bound for logit
     d0 = len(T.bounds)
     d1 = x_tor.shape[1] - d0
-    def pre_softmax(module, x):
-        x = x[0] # input is a tuple
-        out = [x[:,:d0],]
-        count0 = d0
-        for d_i in T.cat_shape:
-            out.append(torch.softmax(x[:,count0:count0+d_i],1))
-            count0 += d_i
-        return torch.cat(out,1)
-    bounds = torch.tensor([[0.0] * d0 + [-b] * d1, [1.0] * d0 + [b] * d1], device=device, dtype=dtype)    
+    pre_softmax = hook_factory(T)
+    #bounds = torch.tensor([[0.0] * d0 + [-b] * d1, [1.0] * d0 + [b] * d1], device=device, dtype=dtype)
+    bounds = torch.tensor([[0.0] * (d0+d1), [1.0] * (d0+d1)], device=device, dtype=dtype)
     model = initialize_model(x_tor,y_tor, BaseKernel)
     for j in range(1,1+Bo_iter):
         # set up acqucision fun
         if 'best_f' in inspect.signature(acq_fun).parameters:
             acq_kwargs['best_f'] = y.max().item() + eps
+        h = model.register_forward_pre_hook(pre_softmax)
         acq = acq_fun(model,**acq_kwargs)
-        acq.register_forward_pre_hook(pre_softmax)
         # optimize over x_next
         x_next = optimize_acqf(acq,bounds,q=q,num_restarts=num_restarts,raw_samples=raw_samples)[0].detach() # 1,d
         x_next = T.backward(x_next[0])
+        h.remove()
         
         # try x_next
         y_next = fun(*x_next)
@@ -167,10 +175,12 @@ def BO(fun,x,y,T,\
             print('best val is {} at iter {}'.format(y_best.item(),j))
     
     x_best_exist,y_best_exist = choose_best(model,bounds,x,y,T,"existing")
+    h = model.register_forward_pre_hook(pre_softmax)
     x_best_mean = choose_best(model,bounds,x,y,T,"mean")
+    h.remove()
     y_best_mean =  fun(*x_best_mean)
     
-    if (y_best_exist > y_best_mean) ^ T.IsMax:
+    if y_best_exist < y_best_mean:
         return x_best_mean,y_best_mean,x,y,model
     else:
         return x_best_exist,y_best_exist,x,y,model 
