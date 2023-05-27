@@ -17,6 +17,9 @@ from botorch.fit import fit_gpytorch_mll # TODO fit_fully_bayesian_model_nuts
 from botorch.optim import optimize_acqf
 from gpytorch.kernels import RBFKernel,MaternKernel,ScaleKernel
 from gpytorch.priors.torch_priors import GammaPrior
+from torch.autograd import Function
+from torch.nn.functional import one_hot
+
 
 device = 'cpu'
 dtype = torch.double
@@ -97,6 +100,15 @@ def initialize_model(x, y, BaseKernel, state_dict=None):
     fit_gpytorch_mll(mll);
     return model
 
+class Mean_std(AnalyticAcquisitionFunction):
+    def __init__(self,model,beta) -> None:
+        super().__init__(model=model)
+        self.beta = beta
+
+    def forward(self, X):
+        mean, std = self._mean_and_sigma(X, compute_sigma=True)
+        return mean - self.beta * std
+    
 def choose_best(model,bounds,x,y,T,type_,beta=0.5):
     if type_ == "existing":
         y_best = np.argmax(y)
@@ -107,7 +119,50 @@ def choose_best(model,bounds,x,y,T,type_,beta=0.5):
         x_best = optimize_acqf(mean_fun,bounds,q=1,num_restarts=1,raw_samples=1)[0].detach()
         return T.backward(x_best[0])
 
-def hook_factory(T):
+class RoundSTE(Function):
+    r"""Apply a rounding function and use a ST gradient estimator."""
+
+    @staticmethod
+    def forward(ctx,input):
+        return input.round()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output
+
+roundSTE = RoundSTE.apply
+
+class OneHotArgmaxSTE(Function):
+    r"""Apply a discretization (argmax) to a one-hot encoded categorical, return a one-hot encoded categorical, and use a STE gradient estimator."""
+    @staticmethod
+    def forward(ctx,input_):
+        return one_hot(input_.argmax(dim=1))
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output
+
+oneHotArgmaxSTE = OneHotArgmaxSTE.apply
+
+# def hook_factory(T,STE):
+#     d0 = len(T.bounds)
+#     def pre_fun(module, x):
+#         x = x[0] # input is a tuple
+#         if STE:
+#             for i in T.integer:
+#                 x[i] = roundSTE(x[i])
+#         out = [x[:,:d0],]
+#         count0 = d0
+#         for d_i in T.cat_shape:
+#             sm = torch.softmax(x[:,count0:count0+d_i],1)
+#             if STE:
+#                 sm = oneHotArgmaxSTE(sm)
+#             out.append(sm)
+#             count0 += d_i
+#         return torch.cat(out,1)
+#     return pre_fun
+
+def hook_factory(T,STE):
     d0 = len(T.bounds)
     def pre_softmax(module, x):
         x = x[0] # input is a tuple
@@ -118,21 +173,14 @@ def hook_factory(T):
             count0 += d_i
         return torch.cat(out,1)
     return pre_softmax
-
-class Mean_std(AnalyticAcquisitionFunction):
-    def __init__(self,model,beta) -> None:
-        super().__init__(model=model)
-        self.beta = beta
-
-    def forward(self, X):
-        mean, std = self._mean_and_sigma(X, compute_sigma=True)
-        return mean - self.beta * std
     
 def BO(fun,x,y,T,\
        acq_fun,
        acq_kwargs,
        BaseKernel,
        eps,# f_best + eps
+       STE,
+       beta,
        q,
        num_restarts,
        raw_samples,
@@ -144,7 +192,7 @@ def BO(fun,x,y,T,\
     #b = 10 # bound for logit
     d0 = len(T.bounds)
     d1 = x_tor.shape[1] - d0
-    pre_softmax = hook_factory(T)
+    pre_softmax = hook_factory(T,STE)
     #bounds = torch.tensor([[0.0] * d0 + [-b] * d1, [1.0] * d0 + [b] * d1], device=device, dtype=dtype)
     bounds = torch.tensor([[0.0] * (d0+d1), [1.0] * (d0+d1)], device=device, dtype=dtype)
     model = initialize_model(x_tor,y_tor, BaseKernel)
@@ -176,9 +224,9 @@ def BO(fun,x,y,T,\
     
     x_best_exist,y_best_exist = choose_best(model,bounds,x,y,T,"existing")
     h = model.register_forward_pre_hook(pre_softmax)
-    x_best_mean = choose_best(model,bounds,x,y,T,"mean")
+    x_best_mean = choose_best(model,bounds,x,y,T,"mean",beta)
     h.remove()
-    y_best_mean =  fun(*x_best_mean)
+    y_best_mean = fun(*x_best_mean)
     
     if y_best_exist < y_best_mean:
         return x_best_mean,y_best_mean,x,y,model
